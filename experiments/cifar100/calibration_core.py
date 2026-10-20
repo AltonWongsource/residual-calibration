@@ -1,0 +1,657 @@
+"""Selected original calibration-runner definitions.
+
+Mechanically extracted; see the source/protocol note in README.md.
+"""
+
+from __future__ import annotations
+import time
+from pathlib import Path
+from typing import Any
+import numpy as np
+from scipy.optimize import minimize
+from scipy.special import softmax
+from sklearn.isotonic import IsotonicRegression
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, log_loss, recall_score, roc_auc_score
+from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.neighbors import NearestNeighbors
+WORKSPACE_ROOT = Path(__file__).resolve().parent
+
+OUTPUT_DIR = WORKSPACE_ROOT / "outputs"
+
+EPS = 1e-12
+
+STANDARD_METHODS = ["TS", "VS", "Dir", "LTS", "ETS", "IROvA", "MIR"]
+
+FC_SAG_METHODS = ["FC", "FC+TS", "FC+ETS", "SAG"]
+
+SINGLE_VIEW_STANDARD_METHODS = STANDARD_METHODS + FC_SAG_METHODS
+
+SINGLE_VIEW_CASCADE_METHODS = SINGLE_VIEW_STANDARD_METHODS.copy()
+
+SAG_NUM_GROUPS = 2
+
+SAG_NUM_PARTITIONS = 20
+
+SAG_LBFGS_STEPS = 100
+
+SAG_WEIGHT_DECAY = 1e-1
+
+SEED = 42
+
+def clip_probs(probs: np.ndarray) -> np.ndarray:
+    probs = np.asarray(probs, dtype=np.float64)
+    probs = np.clip(probs, EPS, 1.0)
+    row_sums = probs.sum(axis=1, keepdims=True)
+    return probs / np.clip(row_sums, EPS, None)
+
+def require_torch_for_sag():
+    try:
+        import torch
+        import torch.nn.functional as F
+    except Exception as exc:  # pragma: no cover - environment dependent
+        raise RuntimeError("SAG requires torch to be installed in the execution environment.") from exc
+    return torch, F
+
+class SAGLinearGrouping:
+    def __init__(self, feature_dim: int, num_groups: int):
+        torch, _ = require_torch_for_sag()
+        self.model = torch.nn.Linear(feature_dim, num_groups, bias=False)
+        self.num_groups = num_groups
+
+    def to(self, device: str):
+        self.model = self.model.to(device)
+        return self
+
+    def cpu(self):
+        self.model = self.model.cpu()
+        return self
+
+    def __call__(self, x):
+        return self.model(x)
+
+    def parameters(self):
+        return self.model.parameters()
+
+    def named_parameters(self):
+        return self.model.named_parameters()
+
+def fit_sag_partitions(
+    features: np.ndarray,
+    logits: np.ndarray,
+    labels: np.ndarray,
+    num_groups: int = SAG_NUM_GROUPS,
+    num_partitions: int = SAG_NUM_PARTITIONS,
+    lbfgs_steps: int = SAG_LBFGS_STEPS,
+    weight_decay: float = SAG_WEIGHT_DECAY,
+    seed: int = SEED,
+) -> list[Any]:
+    torch, F = require_torch_for_sag()
+    device = "cpu"
+    feat_t = torch.as_tensor(features, dtype=torch.float32, device=device)
+    logit_t = torch.as_tensor(logits, dtype=torch.float32, device=device)
+    label_t = torch.as_tensor(labels, dtype=torch.long, device=device)
+    partitions = []
+
+    for partition_idx in range(num_partitions):
+        torch.manual_seed(seed + partition_idx)
+        w_net = SAGLinearGrouping(feat_t.shape[1], num_groups).to(device)
+        tau = torch.nn.Parameter(torch.full((num_groups,), 1.5, dtype=torch.float32, device=device))
+        optimizer = torch.optim.LBFGS(
+            [tau] + list(w_net.parameters()),
+            line_search_fn="strong_wolfe",
+            max_iter=lbfgs_steps,
+        )
+
+        def closure():
+            optimizer.zero_grad()
+            group_log_softmax = torch.log_softmax(w_net(feat_t), dim=1).unsqueeze(-1)
+            temp_log_softmax = torch.log_softmax(logit_t.unsqueeze(1) / tau.view(1, num_groups, 1), dim=2)
+            calibrated_logits = torch.logsumexp(group_log_softmax + temp_log_softmax, dim=1)
+            reg = torch.zeros((), device=device)
+            for name, param in w_net.named_parameters():
+                if "weight" in name:
+                    reg = reg + torch.mean(param**2)
+            loss = F.cross_entropy(calibrated_logits, label_t) + weight_decay * reg
+            loss.backward()
+            return loss
+
+        optimizer.step(closure)
+        partitions.append(w_net.cpu())
+    return partitions
+
+def _safe_groupwise_ts_probs(
+    train_logits: np.ndarray,
+    train_labels: np.ndarray,
+    test_logits: np.ndarray,
+    n_classes: int,
+) -> np.ndarray:
+    train_logits = np.asarray(train_logits, dtype=np.float64)
+    train_labels = np.asarray(train_labels, dtype=int)
+    test_logits = np.asarray(test_logits, dtype=np.float64)
+    if len(test_logits) == 0:
+        return np.zeros((0, n_classes), dtype=np.float64)
+    if len(train_logits) < max(30, 2 * n_classes) or len(np.unique(train_labels)) < 2:
+        return clip_probs(softmax(test_logits, axis=1))
+    model = TemperatureScaling(n_classes)
+    model.fit(train_logits, train_labels)
+    return model.predict_proba(test_logits)
+
+def apply_sag(
+    cal_features: np.ndarray,
+    cal_logits: np.ndarray,
+    cal_labels: np.ndarray,
+    test_features: np.ndarray,
+    test_logits: np.ndarray,
+    seed: int = SEED,
+) -> tuple[np.ndarray, list[Any]]:
+    torch, _ = require_torch_for_sag()
+    partitions = fit_sag_partitions(
+        features=cal_features,
+        logits=cal_logits,
+        labels=cal_labels,
+        seed=seed,
+    )
+    feat_cal_t = torch.as_tensor(cal_features, dtype=torch.float32)
+    feat_test_t = torch.as_tensor(test_features, dtype=torch.float32)
+    all_probs = []
+    for w_net in partitions:
+        train_group_logits = w_net(feat_cal_t)
+        test_group_logits = w_net(feat_test_t)
+        train_groups = torch.argmax(train_group_logits, dim=1).cpu().numpy()
+        test_groups = torch.argmax(test_group_logits, dim=1).cpu().numpy()
+        probs = np.zeros((len(test_logits), cal_logits.shape[1]), dtype=np.float64)
+        for g in range(SAG_NUM_GROUPS):
+            train_mask = train_groups == g
+            test_mask = test_groups == g
+            if not np.any(test_mask):
+                continue
+            group_train_logits = cal_logits[train_mask]
+            group_train_labels = cal_labels[train_mask]
+            group_test_logits = test_logits[test_mask]
+            if len(group_train_logits) == 0:
+                probs[test_mask] = clip_probs(softmax(group_test_logits, axis=1))
+            else:
+                probs[test_mask] = _safe_groupwise_ts_probs(
+                    group_train_logits,
+                    group_train_labels,
+                    group_test_logits,
+                    cal_logits.shape[1],
+                )
+        all_probs.append(clip_probs(probs))
+    return clip_probs(np.mean(np.stack(all_probs, axis=0), axis=0)), partitions
+
+def compute_top_label_ece(probs: np.ndarray, y_true: np.ndarray, n_bins: int = 15) -> float:
+    probs = clip_probs(probs)
+    y_true = np.asarray(y_true)
+    confidences = np.max(probs, axis=1)
+    predictions = np.argmax(probs, axis=1)
+    accuracies = predictions == y_true
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    for idx in range(n_bins):
+        in_bin = (confidences > bin_edges[idx]) & (confidences <= bin_edges[idx + 1])
+        if np.any(in_bin):
+            ece += abs(confidences[in_bin].mean() - accuracies[in_bin].mean()) * in_bin.mean()
+    return float(ece)
+
+def compute_binary_ece(probs: np.ndarray, y_true: np.ndarray, n_bins: int = 15) -> float:
+    probs = clip_probs(probs)
+    y_true = np.asarray(y_true)
+    if probs.shape[1] != 2:
+        return float("nan")
+    p_pos = probs[:, 1]
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    for idx in range(n_bins):
+        in_bin = (p_pos > bin_edges[idx]) & (p_pos <= bin_edges[idx + 1])
+        if np.any(in_bin):
+            ece += abs(p_pos[in_bin].mean() - y_true[in_bin].mean()) * in_bin.mean()
+    return float(ece)
+
+def compute_ace(probs: np.ndarray, y_true: np.ndarray, n_bins: int = 15) -> float:
+    probs = clip_probs(probs)
+    y_true = np.asarray(y_true)
+    n_classes = probs.shape[1]
+    per_class_scores: list[float] = []
+    for cls in range(n_classes):
+        cls_probs = probs[:, cls]
+        cls_true = (y_true == cls).astype(float)
+        order = np.argsort(cls_probs)
+        cls_probs_sorted = cls_probs[order]
+        cls_true_sorted = cls_true[order]
+        bins = np.array_split(np.arange(len(cls_probs_sorted)), n_bins)
+        cls_ace = 0.0
+        non_empty = 0
+        for bin_idx in bins:
+            if len(bin_idx) == 0:
+                continue
+            conf = float(np.mean(cls_probs_sorted[bin_idx]))
+            acc = float(np.mean(cls_true_sorted[bin_idx]))
+            cls_ace += abs(conf - acc)
+            non_empty += 1
+        if non_empty > 0:
+            per_class_scores.append(cls_ace / non_empty)
+    if not per_class_scores:
+        return float("nan")
+    return float(np.mean(per_class_scores))
+
+class TemperatureScaling:
+    def __init__(self, n_classes: int):
+        self.n_classes = n_classes
+        self.temperature = 1.0
+        self.labels = list(range(n_classes))
+
+    def fit(self, logits: np.ndarray, y: np.ndarray) -> None:
+        def loss(t: np.ndarray) -> float:
+            if t[0] <= 0.0:
+                return 1e9
+            return log_loss(y, softmax(logits / t[0], axis=1), labels=self.labels)
+
+        result = minimize(loss, np.array([1.0]), bounds=[(0.01, 20.0)], method="L-BFGS-B")
+        self.temperature = float(result.x[0])
+
+    def predict_proba(self, logits: np.ndarray) -> np.ndarray:
+        return clip_probs(softmax(logits / self.temperature, axis=1))
+
+class VectorScaling:
+    def __init__(self, n_classes: int):
+        self.n_classes = n_classes
+        self.labels = list(range(n_classes))
+        self.weights = np.ones(n_classes, dtype=np.float64)
+        self.bias = np.zeros(n_classes, dtype=np.float64)
+
+    def fit(self, logits: np.ndarray, y: np.ndarray) -> None:
+        def loss(params: np.ndarray) -> float:
+            weights = params[: self.n_classes]
+            bias = params[self.n_classes :]
+            preds = softmax(logits * weights + bias, axis=1)
+            return log_loss(y, preds, labels=self.labels)
+
+        init = np.concatenate([self.weights, self.bias])
+        result = minimize(loss, init, method="L-BFGS-B")
+        self.weights = result.x[: self.n_classes]
+        self.bias = result.x[self.n_classes :]
+
+    def predict_proba(self, logits: np.ndarray) -> np.ndarray:
+        return clip_probs(softmax(logits * self.weights + self.bias, axis=1))
+
+class DirichletCalibration:
+    def __init__(self, n_classes: int):
+        self.n_classes = n_classes
+        self.labels = list(range(n_classes))
+        self.weights = np.eye(n_classes, dtype=np.float64)
+        self.bias = np.zeros(n_classes, dtype=np.float64)
+
+    def fit(self, probs: np.ndarray, y: np.ndarray) -> None:
+        log_probs = np.log(clip_probs(probs))
+
+        def loss(params: np.ndarray) -> float:
+            weights = params[: self.n_classes * self.n_classes].reshape(self.n_classes, self.n_classes)
+            bias = params[self.n_classes * self.n_classes :]
+            preds = softmax(np.dot(log_probs, weights.T) + bias, axis=1)
+            return log_loss(y, preds, labels=self.labels)
+
+        init = np.concatenate([self.weights.flatten(), self.bias])
+        result = minimize(loss, init, method="L-BFGS-B", options={"maxiter": 50})
+        self.weights = result.x[: self.n_classes * self.n_classes].reshape(self.n_classes, self.n_classes)
+        self.bias = result.x[self.n_classes * self.n_classes :]
+
+    def predict_proba(self, probs: np.ndarray) -> np.ndarray:
+        log_probs = np.log(clip_probs(probs))
+        return clip_probs(softmax(np.dot(log_probs, self.weights.T) + self.bias, axis=1))
+
+class LocalTemperatureScaling:
+    def __init__(self, n_classes: int, k_neighbors: int = 100):
+        self.n_classes = n_classes
+        self.k_neighbors = k_neighbors
+        self.t_grid = np.linspace(0.1, 5.0, 50)
+        self.knn: NearestNeighbors | None = None
+        self.y_ref: np.ndarray | None = None
+        self.logits_ref: np.ndarray | None = None
+
+    def fit(self, x_ref: np.ndarray, y_ref: np.ndarray, logits_ref: np.ndarray) -> None:
+        x_ref = np.asarray(x_ref, dtype=np.float32)
+        n_neighbors = min(max(2, self.k_neighbors), len(x_ref))
+        self.knn = NearestNeighbors(n_neighbors=n_neighbors, n_jobs=-1)
+        self.knn.fit(x_ref)
+        self.y_ref = np.asarray(y_ref, dtype=int)
+        self.logits_ref = np.asarray(logits_ref, dtype=np.float64)
+
+    def predict_proba(self, x_test: np.ndarray, logits_test: np.ndarray) -> np.ndarray:
+        assert self.knn is not None
+        assert self.y_ref is not None
+        assert self.logits_ref is not None
+        _, indices = self.knn.kneighbors(np.asarray(x_test, dtype=np.float32))
+        final_probs = np.zeros_like(logits_test, dtype=np.float64)
+        for row_idx, nb_idx in enumerate(indices):
+            nb_logits = self.logits_ref[nb_idx]
+            nb_y = self.y_ref[nb_idx].astype(int)
+            scaled = softmax(nb_logits[None, :, :] / self.t_grid[:, None, None], axis=2)
+            true_probs = np.take_along_axis(scaled, nb_y[None, :, None], axis=2).squeeze(-1)
+            losses = -np.mean(np.log(np.clip(true_probs, EPS, 1.0)), axis=1)
+            best_t = float(self.t_grid[int(np.argmin(losses))])
+            final_probs[row_idx] = softmax(logits_test[row_idx] / best_t, axis=0)
+        return clip_probs(final_probs)
+
+class LAPECalibrator:
+    def __init__(
+        self,
+        n_classes: int,
+        metric: str = "euclidean",
+        candidate_alpha: np.ndarray | None = None,
+        m_anchor_floor: int = 5,
+        k_min_floor: int = 20,
+        k_min_divisor: int = 5,
+        k_max_multiplier: int = 4,
+        k_max_cap: int = 600,
+    ):
+        self.n_classes = n_classes
+        self.metric = metric
+        self.candidate_alpha = (
+            np.asarray(candidate_alpha, dtype=np.float64)
+            if candidate_alpha is not None
+            else np.linspace(0.0, 1.0, 11)
+        )
+        self.m_anchor_floor = m_anchor_floor
+        self.k_min_floor = k_min_floor
+        self.k_min_divisor = k_min_divisor
+        self.k_max_multiplier = k_max_multiplier
+        self.k_max_cap = k_max_cap
+
+        self.y_ref: np.ndarray | None = None
+        self.pi_ref: np.ndarray | None = None
+        self.knn: NearestNeighbors | None = None
+        self.m_anchor = 5
+        self.k_min = 20
+        self.k_max = 21
+
+    def fit(self, x_ref: np.ndarray, y_ref: np.ndarray, base_probs_ref: np.ndarray) -> None:
+        x_ref = np.asarray(x_ref, dtype=np.float32)
+        self.y_ref = np.asarray(y_ref, dtype=int).ravel()
+        self.pi_ref = clip_probs(base_probs_ref)
+        n_ref = len(x_ref)
+        sqrt_n = np.sqrt(max(n_ref, 1))
+
+        self.m_anchor = max(self.m_anchor_floor, int(np.floor(sqrt_n / 2)))
+        self.k_min = max(self.k_min_floor, int(sqrt_n / self.k_min_divisor))
+        self.k_max = min(int(self.m_anchor * self.k_max_multiplier), self.k_max_cap, n_ref - 1)
+        if self.k_max <= self.k_min:
+            self.k_max = min(n_ref - 1, self.k_min + 10)
+        if self.m_anchor >= self.k_max:
+            self.m_anchor = max(1, self.k_max - 1)
+
+        self.knn = NearestNeighbors(n_neighbors=self.k_max + 1, metric=self.metric, n_jobs=-1)
+        self.knn.fit(x_ref)
+
+    def predict(self, x_test: np.ndarray, base_probs_test: np.ndarray) -> np.ndarray:
+        assert self.knn is not None
+        assert self.y_ref is not None
+        assert self.pi_ref is not None
+
+        x_test = np.asarray(x_test, dtype=np.float32)
+        base_probs_test = clip_probs(base_probs_test)
+        distances_all, indices_all = self.knn.kneighbors(x_test)
+        final_probs = np.zeros((len(x_test), self.n_classes), dtype=np.float64)
+        step = max(1, (self.k_max - self.k_min) // 10)
+
+        for row_idx in range(len(x_test)):
+            pi_base = base_probs_test[row_idx]
+            distances = distances_all[row_idx]
+            indices = indices_all[row_idx]
+
+            sigma = max(float(distances[self.m_anchor]), 1e-9)
+            weights_all = np.exp(-((distances[: self.k_max] ** 2) / (sigma**2)))
+            y_nb_all = self.y_ref[indices[: self.k_max]]
+            pi_neigh_all = self.pi_ref[indices[: self.k_max]]
+
+            best_loss = np.inf
+            best_k = self.k_min
+            best_alpha = 0.0
+
+            for k in range(self.k_min, self.k_max + 1, step):
+                y_est = y_nb_all[:k]
+                base_counts = np.bincount(y_est, minlength=self.n_classes)
+                val_counts = np.tile(base_counts, (k, 1))
+                val_counts[np.arange(k), y_est] -= 1
+                p_emp = clip_probs((val_counts + 1.0 / self.n_classes) / k)
+
+                w_k = weights_all[:k]
+                w_k = w_k / np.clip(w_k.sum(), EPS, None)
+                pi_neigh_k = pi_neigh_all[:k]
+
+                for alpha in self.candidate_alpha:
+                    p_mix = (1.0 - alpha) * pi_neigh_k + alpha * p_emp
+                    probs_at_true = p_mix[np.arange(k), y_est]
+                    loss = -np.sum(w_k * np.log(np.clip(probs_at_true, EPS, 1.0)))
+                    if loss < best_loss:
+                        best_loss = loss
+                        best_k = k
+                        best_alpha = float(alpha)
+
+            final_counts = np.bincount(y_nb_all[:best_k], minlength=self.n_classes)
+            p_local = (final_counts + 1.0 / self.n_classes) / (best_k + 1.0)
+            p_local = p_local / np.clip(p_local.sum(), EPS, None)
+            final_probs[row_idx] = (1.0 - best_alpha) * pi_base + best_alpha * p_local
+
+        return clip_probs(final_probs)
+
+def evaluate_predictions(
+    y_true: np.ndarray,
+    probs: np.ndarray,
+    base_predictions: np.ndarray,
+    minority_classes: list[int] | None = None,
+) -> dict[str, Any]:
+    probs = clip_probs(probs)
+    predictions = np.argmax(probs, axis=1)
+    metrics: dict[str, Any] = {
+        "nll": float(log_loss(y_true, probs, labels=list(range(probs.shape[1])))),
+        "accuracy": float(accuracy_score(y_true, predictions)),
+        "ece_toplabel": compute_top_label_ece(probs, y_true),
+        "ace": compute_ace(probs, y_true),
+        "pred_change_rate_vs_base": float(np.mean(predictions != base_predictions)),
+    }
+
+    if probs.shape[1] == 2:
+        metrics["auc"] = float(roc_auc_score(y_true, probs[:, 1]))
+        metrics["ece_binary"] = compute_binary_ece(probs, y_true)
+    else:
+        metrics["auc"] = float("nan")
+        metrics["ece_binary"] = float("nan")
+
+    if minority_classes:
+        metrics["balanced_accuracy"] = float(balanced_accuracy_score(y_true, predictions))
+        metrics["rare_recall_macro"] = float(
+            recall_score(y_true, predictions, labels=minority_classes, average="macro", zero_division=0)
+        )
+        metrics["f1_macro"] = float(f1_score(y_true, predictions, average="macro", zero_division=0))
+    else:
+        metrics["balanced_accuracy"] = float("nan")
+        metrics["rare_recall_macro"] = float("nan")
+        metrics["f1_macro"] = float("nan")
+
+    return metrics
+
+def make_json_safe(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {str(key): make_json_safe(value) for key, value in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [make_json_safe(value) for value in obj]
+    if isinstance(obj, np.ndarray):
+        return [make_json_safe(value) for value in obj.tolist()]
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    return obj
+
+def fit_predict_array_method(
+    method_name: str,
+    n_classes: int,
+    x_cal: np.ndarray,
+    x_test: np.ndarray,
+    logits_cal: np.ndarray,
+    logits_test: np.ndarray,
+    probs_cal: np.ndarray,
+    y_cal: np.ndarray,
+) -> tuple[np.ndarray, float, float]:
+    fit_start = time.perf_counter()
+    if method_name == "TS":
+        model = TemperatureScaling(n_classes)
+        model.fit(logits_cal, y_cal)
+        fit_seconds = time.perf_counter() - fit_start
+        pred_start = time.perf_counter()
+        probs = model.predict_proba(logits_test)
+        return probs, fit_seconds, time.perf_counter() - pred_start
+    if method_name == "VS":
+        model = VectorScaling(n_classes)
+        model.fit(logits_cal, y_cal)
+        fit_seconds = time.perf_counter() - fit_start
+        pred_start = time.perf_counter()
+        probs = model.predict_proba(logits_test)
+        return probs, fit_seconds, time.perf_counter() - pred_start
+    if method_name == "Dir":
+        model = DirichletCalibration(n_classes)
+        model.fit(probs_cal, y_cal)
+        fit_seconds = time.perf_counter() - fit_start
+        pred_start = time.perf_counter()
+        probs = model.predict_proba(clip_probs(softmax(logits_test, axis=1)))
+        return probs, fit_seconds, time.perf_counter() - pred_start
+    if method_name == "LTS":
+        model = LocalTemperatureScaling(n_classes)
+        model.fit(x_cal, y_cal, logits_cal)
+        fit_seconds = time.perf_counter() - fit_start
+        pred_start = time.perf_counter()
+        probs = model.predict_proba(x_test, logits_test)
+        return probs, fit_seconds, time.perf_counter() - pred_start
+    if method_name == "ETS":
+        probs = fit_ets_probs(logits_cal, y_cal, logits_test)
+        fit_seconds = time.perf_counter() - fit_start
+        return probs, fit_seconds, 0.0
+    if method_name == "IROvA":
+        probs = fit_irova_probs(logits_cal, y_cal, logits_test)
+        fit_seconds = time.perf_counter() - fit_start
+        return probs, fit_seconds, 0.0
+    if method_name == "MIR":
+        probs = fit_mir_probs(logits_cal, y_cal, logits_test)
+        fit_seconds = time.perf_counter() - fit_start
+        return probs, fit_seconds, 0.0
+    raise ValueError(f"Unsupported method_name={method_name}")
+
+def build_cv_reference_probs_arrays(
+    method_name: str,
+    n_classes: int,
+    x_cal: np.ndarray,
+    logits_cal: np.ndarray,
+    probs_cal: np.ndarray,
+    y_cal: np.ndarray,
+    seed: int,
+    n_splits: int = 5,
+    cv_kind: str = "kfold",
+) -> np.ndarray:
+    splitter = (
+        KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        if cv_kind == "kfold"
+        else StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    )
+    split_iter = splitter.split(logits_cal) if cv_kind == "kfold" else splitter.split(logits_cal, y_cal)
+    ref_probs = np.zeros_like(probs_cal, dtype=np.float64)
+
+    for train_idx, val_idx in split_iter:
+        x_tr = x_cal[train_idx]
+        x_val = x_cal[val_idx]
+        logits_tr = logits_cal[train_idx]
+        logits_val = logits_cal[val_idx]
+        probs_tr = probs_cal[train_idx]
+        y_tr = y_cal[train_idx]
+
+        if method_name == "TS":
+            model = TemperatureScaling(n_classes)
+            model.fit(logits_tr, y_tr)
+            ref_probs[val_idx] = model.predict_proba(logits_val)
+        elif method_name == "VS":
+            model = VectorScaling(n_classes)
+            model.fit(logits_tr, y_tr)
+            ref_probs[val_idx] = model.predict_proba(logits_val)
+        elif method_name == "Dir":
+            model = DirichletCalibration(n_classes)
+            model.fit(probs_tr, y_tr)
+            ref_probs[val_idx] = model.predict_proba(probs_cal[val_idx])
+        elif method_name == "LTS":
+            model = LocalTemperatureScaling(n_classes)
+            model.fit(x_tr, y_tr, logits_tr)
+            ref_probs[val_idx] = model.predict_proba(x_val, logits_val)
+        elif method_name == "ETS":
+            ref_probs[val_idx] = fit_ets_probs(logits_tr, y_tr, logits_val)
+        elif method_name == "IROvA":
+            ref_probs[val_idx] = fit_irova_probs(logits_tr, y_tr, logits_val)
+        elif method_name == "MIR":
+            ref_probs[val_idx] = fit_mir_probs(logits_tr, y_tr, logits_val)
+        else:
+            raise ValueError(f"Unsupported method_name={method_name}")
+
+    return clip_probs(ref_probs)
+
+def _temperature_scaling_objective(t: np.ndarray, logits: np.ndarray, y: np.ndarray) -> float:
+    if t[0] <= 0:
+        return 1e9
+    probs = clip_probs(softmax(logits / t[0], axis=1))
+    return float(-np.mean(np.log(np.clip(probs[np.arange(len(y)), y], EPS, 1.0))))
+
+def fit_ets_probs(cal_logits: np.ndarray, y_cal: np.ndarray, eval_logits: np.ndarray) -> np.ndarray:
+    n_classes = cal_logits.shape[1]
+    y_cal = np.asarray(y_cal, dtype=int)
+    result_t = minimize(
+        _temperature_scaling_objective,
+        np.array([1.0], dtype=np.float64),
+        args=(np.asarray(cal_logits, dtype=np.float64), y_cal),
+        bounds=[(0.05, 5.0)],
+        method="L-BFGS-B",
+    )
+    t = float(result_t.x[0])
+    p_raw = clip_probs(softmax(cal_logits, axis=1))
+    p_temp = clip_probs(softmax(cal_logits / t, axis=1))
+    p_uniform = np.full_like(p_raw, 1.0 / n_classes)
+
+    def weight_objective(w: np.ndarray) -> float:
+        probs = clip_probs(w[0] * p_temp + w[1] * p_raw + w[2] * p_uniform)
+        return float(-np.mean(np.log(np.clip(probs[np.arange(len(y_cal)), y_cal], EPS, 1.0))))
+
+    cons = {"type": "eq", "fun": lambda w: float(np.sum(w) - 1.0)}
+    res_w = minimize(
+        weight_objective,
+        np.array([1.0, 0.0, 0.0], dtype=np.float64),
+        bounds=[(0.0, 1.0), (0.0, 1.0), (0.0, 1.0)],
+        constraints=cons,
+        method="SLSQP",
+        options={"maxiter": 200, "disp": False},
+    )
+    w = np.asarray(res_w.x, dtype=np.float64)
+
+    p_raw_eval = clip_probs(softmax(eval_logits, axis=1))
+    p_temp_eval = clip_probs(softmax(eval_logits / t, axis=1))
+    p_uniform_eval = np.full_like(p_raw_eval, 1.0 / n_classes)
+    return clip_probs(w[0] * p_temp_eval + w[1] * p_raw_eval + w[2] * p_uniform_eval)
+
+def fit_irova_probs(cal_logits: np.ndarray, y_cal: np.ndarray, eval_logits: np.ndarray) -> np.ndarray:
+    p_cal = clip_probs(softmax(cal_logits, axis=1))
+    p_eval = clip_probs(softmax(eval_logits, axis=1))
+    n_classes = p_cal.shape[1]
+    calibrated = np.zeros_like(p_eval, dtype=np.float64)
+    for cls in range(n_classes):
+        ir = IsotonicRegression(out_of_bounds="clip")
+        cls_target = (np.asarray(y_cal) == cls).astype(float)
+        ir.fit(p_cal[:, cls], cls_target)
+        calibrated[:, cls] = ir.predict(p_eval[:, cls]) + 1e-9 * p_eval[:, cls]
+    return clip_probs(calibrated)
+
+def fit_mir_probs(cal_logits: np.ndarray, y_cal: np.ndarray, eval_logits: np.ndarray) -> np.ndarray:
+    y_onehot = np.eye(cal_logits.shape[1], dtype=np.float64)[np.asarray(y_cal, dtype=int)]
+    p_cal = clip_probs(softmax(cal_logits, axis=1))
+    p_eval = clip_probs(softmax(eval_logits, axis=1))
+    ir = IsotonicRegression(out_of_bounds="clip")
+    calibrated = ir.fit_transform(p_cal.flatten(), y_onehot.flatten())
+    _ = calibrated  # keep fit object consistent with transform usage
+    p_out = ir.predict(p_eval.flatten()).reshape(eval_logits.shape) + 1e-9 * p_eval
+    return clip_probs(p_out)

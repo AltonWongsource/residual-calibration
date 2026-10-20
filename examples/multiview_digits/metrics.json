@@ -1,0 +1,39 @@
+{
+  "source": "OpenML mfeat-fourier + mfeat-zernike, real 2,000-row UCI Multiple Features",
+  "seed": 42,
+  "split_sizes": {
+    "train": 1000,
+    "calibration": 500,
+    "test": 500
+  },
+  "selection": "five-fold calibration OOF NLL; held-out test labels used for final metrics only",
+  "selected_single_view": "zernike",
+  "fusion_weight_fourier": 0.09976412766845064,
+  "metrics": {
+    "view_fourier": {
+      "nll": 0.16539118134169858,
+      "ece": 0.02594998444772352,
+      "accuracy": 0.94
+    },
+    "view_zernike": {
+      "nll": 0.1497299908856482,
+      "ece": 0.02350254066743354,
+      "accuracy": 0.952
+    },
+    "selected_single_view": {
+      "nll": 0.1497299908856482,
+      "ece": 0.02350254066743354,
+      "accuracy": 0.952
+    },
+    "late_fusion": {
+      "nll": 0.11172560405194451,
+      "ece": 0.029414591177739858,
+      "accuracy": 0.96
+    },
+    "cfaf_lape": {
+      "nll": 0.09194941819583767,
+      "ece": 0.025196357835723687,
+      "accuracy": 0.964
+    }
+  }
+}
