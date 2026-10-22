@@ -8,6 +8,7 @@ outputs/
 outputs_cpu/
 demo/output*/
 *.npz
+!demo/breastmnist_resnet18_sample.npz
 *.pt
 *.pth
 *.ckpt

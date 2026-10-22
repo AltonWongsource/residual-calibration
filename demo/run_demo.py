@@ -19,6 +19,7 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
 
 ROOT = Path(__file__).resolve().parents[1]
+SAMPLE = ROOT / "demo" / "breastmnist_resnet18_sample.npz"
 sys.path.insert(0, str(ROOT / "src"))
 from lape_core import LAPECalibrator, TemperatureScaling, VectorScaling  # noqa: E402
 
@@ -78,17 +79,19 @@ def main() -> None:
     parser.add_argument("--npz", type=Path, help="Optional real-model feature/logit bundle; see README")
     parser.add_argument("--calibration", type=Path, help="Calibration NPZ exported by an experiment track")
     parser.add_argument("--test", type=Path, help="Test NPZ exported by the same experiment track")
+    parser.add_argument("--sklearn-example", action="store_true", help="Train the small scikit-learn MLP instead of using the included BreastMNIST model outputs")
     parser.add_argument("--anchor", choices=("TS", "VS"), default="VS")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=Path, default=ROOT / "demo" / "output")
     args = parser.parse_args()
-    if args.npz and (args.calibration or args.test):
-        parser.error("Choose either --npz or the --calibration/--test pair")
+    if sum((bool(args.npz), bool(args.calibration or args.test), args.sklearn_example)) > 1:
+        parser.error("Choose one input: --npz, --calibration/--test, or --sklearn-example")
     if bool(args.calibration) != bool(args.test):
         parser.error("--calibration and --test must be provided together")
     bundle = (load_bundle(args.npz) if args.npz else
               load_split_bundles(args.calibration, args.test) if args.calibration else
-              built_in_data(args.seed))
+              built_in_data(args.seed) if args.sklearn_example else
+              load_bundle(SAMPLE))
     y_cal = bundle["labels_cal"].astype(int)
     y_test = bundle["labels_test"].astype(int)
     logits_cal, logits_test = bundle["logits_cal"], bundle["logits_test"]
@@ -110,21 +113,51 @@ def main() -> None:
     scores = {"base": evaluate(y_test, base_probs), args.anchor: evaluate(y_test, anchor_probs), args.anchor + "+LAPE": evaluate(y_test, refined_probs)}
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / "metrics.json").write_text(json.dumps(scores, indent=2) + "\n", encoding="utf-8")
-    fig, axes = plt.subplots(1, 2, figsize=(8, 3.3), constrained_layout=True)
+    fig, axes = plt.subplots(1, 2, figsize=(9.2, 3.5), constrained_layout=True)
+    fig.patch.set_facecolor("#f5f8fa")
     names = list(scores)
-    axes[0].bar(names, [scores[n]["nll"] for n in names], color=["#64748b", "#0f766e", "#f59e0b"])
+    colors = ["#748894", "#397b9d", "#0c9a91"]
+    axes[0].bar(names, [scores[n]["nll"] for n in names], color=colors, width=.58)
     axes[0].set_title("NLL (lower is better)")
-    axes[1].bar(names, [scores[n]["accuracy"] for n in names], color=["#64748b", "#0f766e", "#f59e0b"])
+    axes[1].bar(names, [scores[n]["accuracy"] for n in names], color=colors, width=.58)
     axes[1].set_title("Accuracy (higher is better)")
+    axes[1].set_ylim(0, 1)
     for ax in axes:
-        ax.grid(axis="y", alpha=0.2)
+        ax.set_facecolor("#f5f8fa")
+        ax.spines[["top", "right", "left"]].set_visible(False)
+        ax.tick_params(length=0, colors="#334c5b")
+        ax.grid(axis="y", alpha=0.15)
         ax.set_axisbelow(True)
     fig.savefig(args.output / "comparison.png", dpi=180)
     plt.close(fig)
     rows = "".join(f"<tr><th>{html.escape(name)}</th><td>{value['nll']:.4f}</td><td>{value['accuracy']:.2%}</td></tr>" for name, value in scores.items())
     image_data = base64.b64encode((args.output / "comparison.png").read_bytes()).decode("ascii")
-    origin = "exported model outputs" if args.npz or args.calibration else "scikit-learn breast-cancer benchmark (illustrative, not a paper result)"
-    report = f"""<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>LAPE demo</title><style>body{{font:16px system-ui,sans-serif;background:#f7f8f6;color:#19302d;max-width:900px;margin:4rem auto;padding:0 1.5rem}}h1{{font-size:2rem}}.card{{background:white;border:1px solid #d9e5df;border-radius:16px;padding:1.5rem;box-shadow:0 8px 24px #163d3010}}img{{max-width:100%}}table{{border-collapse:collapse;width:100%}}th,td{{text-align:left;padding:.7rem;border-bottom:1px solid #e1e9e5}}.note{{color:#52645e}}</style><h1>LAPE calibration demo</h1><p class="note">Source: {html.escape(origin)}. The same held-out test set is used for all three methods; this demo does not claim improvement on every dataset.</p><div class="card"><img alt="NLL and accuracy comparison" src="data:image/png;base64,{image_data}"><table><tr><th>Method</th><th>NLL ↓</th><th>Accuracy ↑</th></tr>{rows}</table></div><p class="note">Anchor: {args.anchor}. Five-fold out-of-fold anchor probabilities are used for the LAPE reference set, and the anchor is refit on the full calibration set for test predictions.</p></html>"""
+    origin = ("your exported model outputs" if args.npz or args.calibration else
+              "scikit-learn breast-cancer MLP" if args.sklearn_example else
+              "BreastMNIST · ResNet18 model outputs")
+    delta = scores[args.anchor]["nll"] - scores[args.anchor + "+LAPE"]["nll"]
+    result = (f"LAPE lowers NLL by {delta:.4f} versus {args.anchor}" if delta > 0 else
+              f"LAPE raises NLL by {-delta:.4f} versus {args.anchor}" if delta < 0 else
+              f"LAPE and {args.anchor} have equal NLL")
+    report = f"""<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>LAPE · calibration result</title>
+<style>
+:root{{--ink:#183746;--muted:#58707d;--line:#d6e1e6;--paper:#f5f8fa;--teal:#0c9a91}}
+*{{box-sizing:border-box}}body{{margin:0;background:var(--paper);color:var(--ink);font:16px/1.55 'Segoe UI',Arial,sans-serif}}
+main{{max-width:1040px;margin:auto;padding:48px 28px 80px}}.eyebrow{{font:700 12px/1.4 Consolas,monospace;letter-spacing:.16em;text-transform:uppercase;color:#397b9d}}
+h1{{font:400 clamp(34px,5vw,57px)/1.1 Georgia,serif;letter-spacing:-.035em;margin:12px 0 16px;max-width:800px}}
+.intro{{color:var(--muted);max-width:720px;margin-bottom:32px}}.result{{border-top:3px solid var(--teal);background:#fff;padding:24px 28px;margin:30px 0;display:flex;gap:32px;align-items:baseline;justify-content:space-between}}
+.result strong{{font:400 clamp(23px,3vw,34px)/1.2 Georgia,serif}}.result span{{color:var(--muted);font:13px Consolas,monospace;white-space:nowrap}}
+.panel{{background:#fff;border:1px solid var(--line);padding:28px;margin-top:18px}}h2{{font:400 24px Georgia,serif;margin:0 0 14px}}img{{display:block;max-width:100%;height:auto;margin:auto}}
+table{{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}}th,td{{text-align:left;padding:13px 10px;border-bottom:1px solid var(--line)}}thead th{{color:var(--muted);font-size:13px}}tbody th{{font-weight:600}}tbody tr:last-child{{background:#e9f7f5}}
+.method{{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:28px}}.method div{{border-top:1px solid var(--line);padding-top:12px}}.method b{{display:block;font:700 12px Consolas,monospace;color:#397b9d;margin-bottom:7px}}.method p{{margin:0;color:var(--muted);font-size:14px}}footer{{color:var(--muted);font-size:13px;margin-top:25px}}
+@media(max-width:700px){{main{{padding:28px 16px 50px}}.result{{display:block}}.result span{{display:block;margin-top:10px;white-space:normal}}.panel{{padding:16px}}.method{{grid-template-columns:1fr}}}}
+</style><main><div class="eyebrow">LAPE / local calibration</div><h1>From a global anchor to local refinement.</h1>
+<p class="intro">{html.escape(origin)} · {len(y_cal)} calibration examples · {len(y_test)} held-out test examples. The same test set is used for every method.</p>
+<div class="result"><strong>{html.escape(result)}</strong><span>NLL ↓ &nbsp;·&nbsp; held-out test</span></div>
+<section class="panel"><h2>Compare the three predictions</h2><img alt="NLL and accuracy for base, anchor and anchor plus LAPE" src="data:image/png;base64,{image_data}">
+<table><thead><tr><th>Method</th><th>NLL ↓</th><th>Accuracy ↑</th></tr></thead><tbody>{rows}</tbody></table></section>
+<section class="method"><div><b>BASE</b><p>Original model logits, before calibration.</p></div><div><b>{args.anchor}</b><p>Global anchor fitted on calibration labels.</p></div><div><b>{args.anchor}+LAPE</b><p>Local feature-space correction on top of the anchor.</p></div></section>
+<footer>Five-fold out-of-fold anchor predictions build the LAPE reference set. Test labels are used only for the displayed metrics.</footer></main></html>"""
     (args.output / "report.html").write_text(report, encoding="utf-8")
     print(json.dumps(scores, indent=2))
     print(f"Saved demo output to {args.output}")

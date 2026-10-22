@@ -20,7 +20,7 @@ Datasets and pretrained weights are obtained from their providers; generated cac
 
 ## Try the method now
 
-Install the small demo environment. Then:
+Install the small demo environment and run the included BreastMNIST / ResNet18 model outputs:
 
 ```bash
 pip install -r requirements-demo.txt
@@ -28,7 +28,9 @@ python demo/run_demo.py
 python demo/make_walkthrough.py demo/output
 ```
 
-This small demo trains an MLP on scikit-learn's breast-cancer dataset, fits a TS or VS anchor, creates five-fold out-of-fold anchor probabilities, and applies `LAPECalibrator` from `src/lape_core.py`. It writes `demo/output/report.html`, `comparison.png`, `metrics.json`, and (with the second command) `walkthrough.gif`. Paper experiments are in `experiments/`.
+Open `demo/output/report.html` to see the result. The included NPZ contains calibration/test features and logits from the BreastMNIST ResNet18 run, not images or pretrained weights. The command refits a VS anchor, creates five-fold out-of-fold anchor probabilities, and applies `LAPECalibrator` from `src/lape_core.py`. It writes `report.html`, `comparison.png`, `metrics.json`, and (with the second command) `walkthrough.gif` under `demo/output/`. The same run is previewed in [`examples/breastmnist/`](examples/breastmnist/).
+
+To try the small scikit-learn MLP example instead, run `python demo/run_demo.py --sklearn-example`. Its results are illustrative and can differ from the paper experiment.
 
 For your own frozen classifier or an exported paper-model artifact:
 

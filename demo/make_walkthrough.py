@@ -17,21 +17,21 @@ def font(size: int):
 
 
 def frame(title: str, subtitle: str, values: list[tuple[str, float, str]], highlight: int) -> Image.Image:
-    image = Image.new("RGB", (900, 500), "#f6f8f5")
+    image = Image.new("RGB", (900, 500), "#f5f8fa")
     draw = ImageDraw.Draw(image)
-    draw.rounded_rectangle((35, 35, 865, 465), radius=26, fill="#ffffff", outline="#dce8df", width=2)
-    draw.text((70, 70), title, font=font(34), fill="#173a33")
-    draw.text((70, 122), subtitle, font=font(18), fill="#52665f")
+    draw.rounded_rectangle((35, 35, 865, 465), radius=18, fill="#ffffff", outline="#d6e1e6", width=2)
+    draw.text((70, 70), title, font=font(34), fill="#183746")
+    draw.text((70, 122), subtitle, font=font(18), fill="#58707d")
     max_value = max(value for _, value, _ in values) * 1.15
     for i, (name, value, color) in enumerate(values):
         y = 195 + i * 75
-        draw.text((75, y), name, font=font(24), fill="#213832")
+        draw.text((75, y), name, font=font(24), fill="#183746")
         width = int(520 * value / max_value)
         draw.rounded_rectangle((230, y - 2, 230 + width, y + 36), radius=7, fill=color)
-        draw.text((760, y), f"{value:.4f}", font=font(24), fill="#173a33")
+        draw.text((760, y), f"{value:.4f}", font=font(24), fill="#183746")
         if i == highlight:
-            draw.rounded_rectangle((60, y - 12, 830, y + 48), radius=10, outline="#0f766e", width=3)
-    draw.text((75, 435), "NLL lower is better  |  same held-out test set", font=font(15), fill="#687a73")
+            draw.rounded_rectangle((60, y - 12, 830, y + 48), radius=10, outline="#0c9a91", width=3)
+    draw.text((75, 435), "NLL lower is better  |  same held-out test set", font=font(15), fill="#58707d")
     return image
 
 
@@ -41,7 +41,7 @@ def main() -> None:
     args = parser.parse_args()
     scores = json.loads((args.output_dir / "metrics.json").read_text(encoding="utf-8"))
     names = list(scores)
-    colors = ["#64748b", "#0f766e", "#f59e0b"]
+    colors = ["#748894", "#397b9d", "#0c9a91"]
     values = [(name, scores[name]["nll"], colors[i]) for i, name in enumerate(names)]
     frames = [
         frame("LAPE on real model outputs", "Anchor calibration followed by local refinement", values, -1),
